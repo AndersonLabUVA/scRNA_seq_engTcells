@@ -1,0 +1,981 @@
+---
+title: "GFA-KA-Data-Analysis"
+author: "Gabriel Alencar"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    number_sections: yes
+---
+
+# Data Analysis
+
+## Load Packages
+```{r load_packages}
+library(Seurat)
+library(tidyverse)
+library(grid)
+library(gridExtra)
+library(splitstackshape)
+library(textclean)
+library(immunarch)
+library(ggsci)
+library(dsb)
+library(SingleR)
+library(biomaRt)
+library(fgsea)
+library(reticulate)
+library(DOSE)
+library(enrichplot)
+library(ReactomePA)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(scales)
+options(Seurat.object.assay.version = "v5")
+```
+
+## Functions
+In the following chunck, I have created a few functions that will speed up our analysis downstream.
+
+``` {r functions}
+check_cell_count <- function(original_data, subset_data, sample_name) {
+  # Calculate the number of cells in the original and subsetted data
+  original_cell_count <- length(colnames(original_data))
+  subset_cell_count <- length(colnames(subset_data))
+  
+  # Calculate the percentage of cells from the original cell count to the subset cell count
+  cell_percentage <- round((subset_cell_count / original_cell_count) * 100, 2)
+  
+  # Check if the number of cells in the subsetted data is less than 50% of the original data
+  if (subset_cell_count < 0.5 * original_cell_count) {
+    print(paste0("Library: ", sample_name, ". Warning: The number of cells in the subsetted data is less than 50% of the original data. Original Cell Count: ", original_cell_count," Subset Count: " , subset_cell_count, " (", cell_percentage, "% of the original)"))
+  } else if (subset_cell_count > 0.9 * original_cell_count) {
+    print(paste0("Library: ", sample_name, ". Warning: The number of cells in the subsetted data is more than 90% of the original data. Original Cell Count: ", original_cell_count," Subset Count: " , subset_cell_count, " (", cell_percentage, "% of the original)"))
+  }
+  else {
+    print(paste0("Library: ", sample_name, ". The number of cells in the subsetted data is more than 50% of the original data. Original Cell Count: ", original_cell_count," Subset Count: " , subset_cell_count, " (", cell_percentage, "% of the original)"))
+  }
+}
+
+# Use the function to check the cell counts in your data
+#check_cell_count(i_so_data, i_so_data_filt, sampleID[i]) if you are keeping my nomenclature on the loops
+
+#The following function should be used to create UMAPs for each Cell Type (it can be cluster numbers, or any other section that you want to highlight). 
+plot_cells_by_metadata <- function(seurat_object, seurat_object_name, metadata_column, work_dir_figures, 
+                                   project_name, date_processed, fileAdd, reduction_type = "umap") {
+  # Set the identity of the Seurat object to the specified metadata column
+  Idents(seurat_object) <- metadata_column
+  
+  # Get the unique levels of the metadata column
+  ordered_levels <- unique(seurat_object@meta.data[[metadata_column]])
+  
+  # Iterate over the ordered levels
+  for (i in 1:length(ordered_levels)) {
+    # Get the cells for the current level
+    # Print the current level
+    print(paste("Processing level:", ordered_levels[i]))
+    
+    g1_treat <- WhichCells(seurat_object, ident = ordered_levels[i])
+    
+    # Create the plot
+    g <- DimPlot(seurat_object, reduction = reduction_type, cells.highlight = g1_treat,
+                 cols.highlight = c("black"), cols = c("lightgray"), raster = FALSE) +
+      ggtitle(ordered_levels[i]) + ggplot2::theme(legend.position = "none")
+    
+    # Print the plot
+    print(g)
+    
+    # Replace '/' and blank spaces with '_' in the ordered_levels for the file name
+    file_name <- gsub("[/ ]", "_", ordered_levels[i])
+    
+    # Save the figure to a separate PDF file
+    pdf(file = paste0(work_dir_figures, project_name, "_", seurat_object_name, "_", date_processed, fileAdd, 
+                      reduction_type, file_name, "_Cell_location.pdf"), width = 10, height = 10)
+    print(DimPlot(seurat_object, reduction = reduction_type, cells.highlight = g1_treat,
+                  cols.highlight = c("black"), cols = c("lightgray"), raster = FALSE) +
+            ggtitle(ordered_levels[i]) + ggplot2::theme(legend.position = "none"))
+    dev.off()
+  }
+}
+
+get_fold_changes <- function(seurat_object, ident1, ident2) {
+  fc <- FoldChange(seurat_object, ident.1 = ident1, ident.2 = ident2, slot='data')
+  list(avg_log2FC = fc$avg_log2FC, rownames = rownames(fc))
+}
+
+convert_mouse_to_human <- function(gene_list, mouse_human_genes){
+  output = c()
+  for(gene in gene_list){
+    class_key = (mouse_human_genes %>% filter(Symbol == gene & Common.Organism.Name=="mouse, laboratory"))[['DB.Class.Key']]
+    if(!identical(class_key, integer(0)) ){
+      human_genes = (mouse_human_genes %>% filter(DB.Class.Key == class_key & Common.Organism.Name=="human"))[,"Symbol"]
+      for(human_gene in human_genes[1]){
+        output = append(output,human_gene)
+      }
+    }
+  }
+  return (output)
+}
+
+plot_enrichment <- function(gene_set, gene_data, title, work_dir_figures, project_name, date_processed, fileAdd) {
+  # Create the plot
+  p <- plotEnrichment(gene_set, gene_data) + labs(title=title)
+  
+  # Print the plot
+  print(p)
+  
+  # Replace '/' and blank spaces with '_' in the title for the file name
+  file_name <- gsub("[/ ]", "_", title)
+  
+  # Save the figure to a separate PDF file
+  pdf(file = paste0(work_dir_figures, project_name, "_", date_processed, fileAdd, "_", file_name, ".pdf"), 
+      width = 10, height = 10)
+  print(p)
+  dev.off()
+}
+
+
+# Define the function
+add_entrez_id <- function(df, gene_column) {
+  # Get the mapping from org.Mm.eg.db
+  mapping <- select(org.Mm.eg.db, keys = df[[gene_column]], columns = "ENTREZID", keytype = "SYMBOL")
+  
+  # Merge the mapping with the original data frame
+  merged_df <- merge(df, mapping, by.x = gene_column, by.y = "SYMBOL", all.x = TRUE)
+  
+  return(merged_df)
+}
+
+
+perform_enrichment_analysis <- function(genes, type, i) {
+  # Perform KEGG pathway analysis
+  kegg_results <- enrichKEGG(gene = genes$ENTREZID, organism = 'mmu', keyType = 'kegg')
+  write.csv(kegg_results, file= paste0(work_dir_outputs, project_name, date_processed,
+                                       names_list[i], "_", type, "_kegg_results.csv"))
+
+  # Perform GO BP analysis
+  go_bp_results <- enrichGO(gene = genes$ENTREZID, OrgDb = org.Mm.eg.db, ont = "BP")
+  write.csv(go_bp_results, file= paste0(work_dir_outputs, project_name, date_processed,
+                                       names_list[i], "_", type, "_go_bp_results.csv"))
+
+  # Perform GO MF analysis
+  go_mf_results <- enrichGO(gene = genes$ENTREZID, OrgDb = org.Mm.eg.db, ont = "MF")
+  write.csv(go_mf_results, file= paste0(work_dir_outputs, project_name, date_processed,
+                                       names_list[i], "_", type, "_go_mf_results.csv"))
+  
+  # Perform Reactome analysis
+  reactome_results <- enrichPathway(gene = genes$ENTREZID, organism = "mouse")
+  write.csv(reactome_results, file= paste0(work_dir_outputs, project_name, date_processed,
+                                       names_list[i], "_", type, "_reactome_results.csv"))
+  
+  # Perform DO analysis
+  do_results <- enrichDO(gene = genes$ENTREZID, ont="DO",
+                         pvalueCutoff  = 0.05,
+                         qvalueCutoff  = 0.05,
+                         pAdjustMethod = "BH")
+  write.csv(do_results, file= paste0(work_dir_outputs, project_name, date_processed,
+                                       names_list[i], "_", type, "_do_results.csv"))
+
+  # List of all pathway analysis results
+  pathway_results_list <- list(kegg_results, go_bp_results, go_mf_results, reactome_results)
+  
+  # Corresponding names for the results
+  pathway_names_list <- c("KEGG", "GO_BP", "GO_MF", "Reactome")
+  
+  # Loop through the list of pathway analysis results
+  for (j in 1:length(pathway_results_list)) {
+    # Print the results
+    print(pathway_results_list[[j]])
+    
+    # Create a dotplot
+    dotplot <- dotplot(pathway_results_list[[j]])
+    dotplot
+    # Save the dotplot to a PDF file
+    ggsave(paste0(work_dir_figures, project_name, date_processed, fileAdd,
+                  names_list[i], "_", type, "_", pathway_names_list[j], "_dotplot.pdf"), plot = dotplot)
+  }
+}
+
+
+
+```
+
+
+## Create the Seurat Object and Filter Cell
+
+```{r create_Seurat_object_and_filter, warning=FALSE}
+# Set directories
+base_dir <- "/Users/gabrielalencar/Documents/02.Anderson.Lab/GFA-KA-0001-Project-Folder/" #this needs to be changed to you work location
+sample_dir <- paste0(base_dir, "Raw_and_Aligned_Data/")
+
+project_name <- "GFA-KA-0001.8.2-"
+work_dir_figures <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/Figures/")
+work_dir_outputs <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/Outputs/")
+work_dir_rds <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/RDS_files/")
+
+# Dynamic variables for file naming
+fileAdd <- ""
+date_processed <- paste0(gsub("-","", Sys.Date()), "_")
+
+##########################################
+
+#### Create individual Seurat Objects for each sample
+
+# Sample ID values
+sampleID <- c('MB_22_23_T_cells_plus_3x_checkpoint_Abs', 'MB_22_23_T_cells_plus_isotype', 
+              'MB_22_23_T_cells_plus_PD1', 
+              'Tcells_plus_PD1_plus_Lag3', 'Tcells_plus_PD1_plus_Tim3',
+              'pre_transfer_MSLN_T_cells')
+
+# Create individual Seurat objects from cellranger ouput
+# Remove mitonchondrial & ribosomal reads
+# Filter cells based on nCount_max
+for (i in 1:length(sampleID)) {
+  
+  # Read the 10X data
+  i_data <- Read10X(data.dir = paste0(sample_dir, sampleID[i], "/sample_feature_bc_matrix"))
+  # For other samples, proceed as before
+  colnames(i_data$`Gene Expression`) <- paste0((colnames(i_data$`Gene Expression`)), "_", sampleID[i])
+  colnames(i_data$`Antibody Capture`) <- paste0((colnames(i_data$`Antibody Capture`)), "_", sampleID[i])
+  i_so_data<- CreateSeuratObject(counts = i_data$`Gene Expression`, 
+                               project = sampleID[i], min.cells = 1, min.features = 1)
+  ADTs <- i_data$`Antibody Capture`@Dimnames[[1]][9:nrow(i_data$`Antibody Capture`)]
+  i_so_data.atd <- CreateAssayObject(counts = i_data$`Antibody Capture`[ADTs,], project = sampleID[i])
+  i_so_data[['ADT']]=i_so_data.atd
+  
+  # QC of features, counts, and mito reads
+  i_so_data[["percent.mt"]] <- PercentageFeatureSet(object = i_so_data, pattern = "^mt-")
+  i_so_data[["percent.hemo"]] <- PercentageFeatureSet(object = i_so_data, pattern = "^Hbb-")
+  
+
+  # Plot RNA counts x Percent mito and RNA counts x RNA features
+  # Data subset plots are created using filtering parameters from above
+  pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, sampleID[i],
+                    "_SeuratObj_VlnPlots_MT_HEMO_COUNTS_READS_pre_filter.pdf"), width = 20, height = 25)
+  grid.arrange(
+    VlnPlot(i_so_data, features = "nFeature_RNA") + NoLegend() + 
+      theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab(""),
+    VlnPlot(i_so_data, features = "nCount_RNA") + NoLegend() + 
+      theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab("") + scale_y_log10() + ylab("Log 10 Scale"),
+    VlnPlot(i_so_data, features = "percent.mt") + NoLegend() + 
+      theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab(""),
+    VlnPlot(i_so_data, features = "percent.hemo") + NoLegend() + 
+    theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab(""), nrow = 2, 
+    bottom = "QC showing number of reads, counts, percent mitochondrial and hemoglobin
+    (pre-filter)")
+  dev.off()
+  
+  plot1 <- FeatureScatter(i_so_data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")  + 
+    theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1)) + xlab("Total RNA reads") + 
+    ylab("Number of expressed genes")
+  plot2 <- FeatureScatter(i_so_data, feature1 = "nCount_RNA", feature2 = "percent.mt") + 
+    theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1)) + xlab("Total RNA reads") + 
+    ylab("Percent Mitochondrial Genes")
+  plot3 <- FeatureScatter(i_so_data, feature1 = "nCount_RNA", feature2 = "percent.hemo") + 
+    theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1)) + xlab("Total RNA reads") + 
+    ylab("Percent Hemoglobin Beta")
+  
+  #Plot all 3 graphs
+  grid.arrange(plot1, plot2, plot3, nrow = 3,
+             top = "QC control showing correlation of number of reads, percent mitochondrial and hemoglobin beta genes 
+             (pre-filter)")
+  pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, sampleID[i],
+                    "_SeuratObj_FeatureCorrelation_MT_HEMO_COUNTS_READS_pre_filter.pdf"), width = 20, height = 25)
+  grid.arrange(plot1, plot2, plot3, nrow = 3,
+               top = "QC control showing correlation of number of reads, percent mitochondrial and hemoglobin beta genes
+               (pre-filter)")
+  dev.off()
+  
+  #First check the number of genes and the number of cells pre-filtering
+  # Get dimensions of i_so_data
+  print(dim(i_so_data))
+  # Select features from Gene Expression
+  selected_f_g <- rownames(i_so_data@assays$RNA)[Matrix::rowSums(i_so_data@assays$RNA) > 5]
+  # Select features from ADT
+  selected_f_P <- rownames(i_so_data@assays$ADT)[Matrix::rowSums(i_so_data@assays$ADT) > 5]
+  
+  # Subset i_so_data
+  i_so_data.filt <- subset(i_so_data, subset = nFeature_RNA > 200 & nFeature_RNA < 10000 & percent.mt < 10 & 
+                           percent.hemo < 0.05, features = c(selected_f_g , selected_f_P))
+  # Print i_so_data.filt and its dimensions
+  print(i_so_data.filt)
+  print(dim(i_so_data.filt))
+
+  QC_Table_Cells_Cutoff <- rbind(dim(i_so_data), dim(i_so_data.filt))
+  write.table(QC_Table_Cells_Cutoff, file= paste0(work_dir_outputs, project_name, date_processed,
+                                                  "QC_Table_Cells_Cutoff.csv"), sep=",", append=TRUE,
+              row.names=c(i_so_data@project.name, i_so_data.filt@project.name), col.names=FALSE)
+  
+  pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, sampleID[i],
+                    "_SeuratObj_VlnPlots_MT_HEMO_COUNTS_READS_post_filter.pdf"), width = 20, height = 25)
+  
+
+  grid.arrange(
+    VlnPlot(i_so_data.filt, features = "nFeature_RNA") + NoLegend() + 
+      theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab(""),
+    VlnPlot(i_so_data.filt, features = "nCount_RNA") + NoLegend() + 
+      theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab("") +
+      scale_y_log10() + ylab("Log 10 Scale"),
+    VlnPlot(i_so_data.filt, features = "percent.mt") + NoLegend() + 
+      theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab(""),
+    VlnPlot(i_so_data.filt, features = "percent.hemo") + NoLegend() + 
+    theme(axis.text.x = element_text(angle = 45, size = 10, hjust = 1)) + xlab(""), 
+    nrow = 2, bottom = "QC showing number of reads, counts, percent mitochondrial and hemoglobin(post-filter)")
+
+  plot1 <- FeatureScatter(i_so_data.filt, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")  + 
+    theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1)) + xlab("Total RNA reads") + 
+    ylab("Number of expressed genes")
+  plot2 <- FeatureScatter(i_so_data.filt, feature1 = "nCount_RNA", feature2 = "percent.mt") + 
+    theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1)) + xlab("Total RNA reads") + 
+    ylab("Percent Mitochondrial Genes")
+  plot3 <- FeatureScatter(i_so_data.filt, feature1 = "nCount_RNA", feature2 = "percent.hemo") + 
+    theme(axis.text.x = element_text(angle = 45, size = 12, hjust = 1)) + xlab("Total RNA reads") + 
+    ylab("Percent Hemoglobin Beta")
+  
+  #Plot all 3 graphs
+  grid.arrange(plot1, plot2, plot3, nrow = 3,
+             top = "QC control showing correlation of number of reads, percent mitochondrial and hemoglobin beta genes 
+             (post-filter)")
+  pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, sampleID[i],
+                    "_SeuratObj_FeatureCorrelation_MT_HEMO_COUNTS_READS_post_filter.pdf"), width = 20, height = 25)
+  grid.arrange(plot1, plot2, plot3, nrow = 3,
+               top = "QC control showing correlation of number of reads, percent mitochondrial and hemoglobin beta genes
+               (post-filter)")
+  dev.off()
+  
+  check_cell_count(i_so_data, i_so_data.filt, sampleID[i])
+  
+  # Save mito/rp removed and filtered files for subsequent merging and analysis
+  saveRDS(i_so_data.filt, file = paste0(work_dir_rds,  project_name, 
+                                        date_processed, fileAdd, sampleID[i], "_SO_rmMTHemo.Rds"))
+  
+}
+# Get a list of all objects in the global environment
+all_objects <- ls()
+
+# Filter out functions
+non_function_objects <- all_objects[!sapply(all_objects, function(x) is.function(get(x)))]
+
+# Remove non-function objects
+rm(list = non_function_objects)
+```
+**Notes from preliminary analysis:**
+
+## Data normalization and clustering
+```{r Merge_Metadata}
+base_dir <- "/Users/gabrielalencar/Documents/02.Anderson.Lab/GFA-KA-0001-Project-Folder/" #this needs to be changed to you work location
+sample_dir <- paste0(base_dir, "Raw_and_Aligned_Data/")
+
+project_name <- "GFA-KA-0001.8.2-"
+work_dir_figures <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/Figures/")
+work_dir_outputs <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/Outputs/")
+work_dir_rds <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/RDS_files/")
+
+# Dynamic variables for file naming
+fileAdd <- ""
+date_processed <- paste0(gsub("-","", Sys.Date()), "_")
+
+##########################################
+
+#### Create individual Seurat Objects for each sample
+
+# Sample ID values
+sampleID <- c('MB_22_23_T_cells_plus_3x_checkpoint_Abs', 'MB_22_23_T_cells_plus_isotype', 
+              'MB_22_23_T_cells_plus_PD1', 
+              'Tcells_plus_PD1_plus_Lag3', 'Tcells_plus_PD1_plus_Tim3',
+              'pre_transfer_MSLN_T_cells')
+
+# Merge individual Seurat objects from each sample
+
+# Read in individual Seurat objects
+seurat_list <- list()
+for (i in 1:length(sampleID)) {
+  so <- readRDS(paste0(work_dir_rds, project_name, date_processed, fileAdd, sampleID[i], "_SO_rmMTHemo.Rds"))
+  Idents(object = so) <- sampleID[i]
+  assign(paste0(sampleID[i], "_so"), so)
+  seurat_list[[i]] <- so
+}
+
+# Merged individual Seurat objects
+soMerged <- merge(seurat_list[[1]],y=seurat_list[-1])
+
+saveRDS(soMerged, file = paste0(work_dir_rds, project_name, date_processed, fileAdd, "SOmerged.Rds"))
+# Get a list of all objects in the global environment
+all_objects <- ls()
+
+# Filter out functions
+non_function_objects <- all_objects[!sapply(all_objects, function(x) is.function(get(x)))]
+
+# Remove non-function objects
+rm(list = non_function_objects)
+```
+
+## Normalizing and Clustering
+
+```{r nomalization}
+# Set directories
+base_dir <- "/Users/gabrielalencar/Documents/02.Anderson.Lab/GFA-KA-0001-Project-Folder/" #this needs to be changed to you work location
+sample_dir <- paste0(base_dir, "Raw_and_Aligned_Data/")
+
+project_name <- "GFA-KA-0001.8.2-"
+work_dir_figures <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/Figures/")
+work_dir_outputs <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/Outputs/")
+work_dir_rds <- paste0(base_dir, "GFA-KA-0001.8-Analysis-Folder/0002_current_analysis_202402/RDS_files/")
+
+# Dynamic variables for file naming
+fileAdd <- ""
+date_processed <- paste0(gsub("-","", Sys.Date()), "_")
+
+# Read in seurat object
+engTcellsOvarianCancer <- readRDS(paste0(work_dir_rds, project_name, date_processed, "SOmerged.Rds"))
+engTcellsOvarianCancer <- JoinLayers(engTcellsOvarianCancer)
+# Samples to call on the meta.data$orig.ident
+
+sampleID <- c('MB_22_23_T_cells_plus_3x_checkpoint_Abs', 'MB_22_23_T_cells_plus_isotype', 
+              'MB_22_23_T_cells_plus_PD1', 
+              'Tcells_plus_PD1_plus_Lag3', 'Tcells_plus_PD1_plus_Tim3',
+              'pre_transfer_MSLN_T_cells')
+
+
+Idents(engTcellsOvarianCancer) <- 'orig.ident'
+engTcellsOvarianCancer <- RenameIdents(object = engTcellsOvarianCancer,
+                          `MB_22_23_T_cells_plus_3x_checkpoint_Abs` = "eng. T cells + Triple AB treatment",
+                          `MB_22_23_T_cells_plus_isotype` = "eng. T cells + Isotype",
+                          `MB_22_23_T_cells_plus_PD1` = "eng. T cells + PD1",
+                          `Tcells_plus_PD1_plus_Lag3` = "eng. T cells + PD1 and Lag3",
+                          `Tcells_plus_PD1_plus_Tim3` = "eng. T cells + PD1 and Tim3",
+                          `pre_transfer_MSLN_T_cells` = "Pre-transfer eng. T cells")
+
+
+table(engTcellsOvarianCancer$orig.ident) #to confirm the change has happened.
+engTcellsOvarianCancer$orig.ident <- Idents(engTcellsOvarianCancer)
+
+ordered_levels <- c("Pre-transfer eng. T cells", "eng. T cells + Isotype", 
+                    "eng. T cells + PD1", "eng. T cells + PD1 and Lag3", 
+                    "eng. T cells + PD1 and Tim3", "eng. T cells + Triple AB treatment")
+
+# Reorder the levels
+engTcellsOvarianCancer$orig.ident <- factor(engTcellsOvarianCancer$orig.ident, levels = ordered_levels)
+table(engTcellsOvarianCancer$orig.ident) 
+
+set.seed(123456)
+
+# Perform standard Seurat normalization steps
+
+DefaultAssay(engTcellsOvarianCancer) <- 'RNA'
+engTcellsOvarianCancer <- NormalizeData(engTcellsOvarianCancer, normalization.method = "LogNormalize") %>%
+  FindVariableFeatures(nfeatures = 10000) %>% ScaleData() %>% RunPCA()
+
+ElbowPlot(engTcellsOvarianCancer, ndims = 50)
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd,
+                    "engTcellsOvarianCancer_SeuratObj_Merged_ElbowPlot.pdf"))
+ElbowPlot(engTcellsOvarianCancer, ndims = 50)
+dev.off()
+
+engTcellsOvarianCancer <- FindNeighbors(engTcellsOvarianCancer, dims = 1:20)
+engTcellsOvarianCancer <- FindClusters(engTcellsOvarianCancer, resolution = 1)
+engTcellsOvarianCancer <- RunUMAP(engTcellsOvarianCancer, dims = 1:20)
+
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+p1<-DimPlot(engTcellsOvarianCancer, reduction = "umap", label=TRUE)
+p2<-DimPlot(engTcellsOvarianCancer, reduction = "umap", group.by="orig.ident")
+p1+p2
+
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd,
+                    "engTcellsOvarianCancer_SeuratObj_Merged_Dimplots_Cluster_Orig.Ident.pdf"))
+p1+p2
+dev.off()
+
+# Save seurat object
+saveRDS(engTcellsOvarianCancer, file = paste0(work_dir_rds, project_name, date_processed, fileAdd, "engTcellsOvarianCancermerged_sctPCAumapNN.Rds"))
+
+plot_cells_by_metadata(engTcellsOvarianCancer,"engTcellsOvarianCancer" ,"orig.ident", 
+                       work_dir_figures, project_name, date_processed, fileAdd, reduction_type = "umap")
+
+# Create individual plots for antibody informatoin as a raw file to see how they look
+p1 <- RidgePlot(engTcellsOvarianCancer, features = 'CD90/CD90.1', group.by = "orig.ident") + 
+  scale_x_continuous(limits = c(0, 10)) +
+  theme(legend.position = "none")
+p2 <- RidgePlot(engTcellsOvarianCancer, features = 'CD90.2', group.by = "orig.ident") + 
+  scale_x_continuous(limits = c(0, 10)) +
+  theme(legend.position = "none")
+p3 <- RidgePlot(engTcellsOvarianCancer, features = 'CD8a', group.by = "orig.ident") + 
+  scale_x_continuous(limits = c(0, 10)) +
+  theme(legend.position = "none")
+p4 <- RidgePlot(engTcellsOvarianCancer, features = 'CD4', group.by = "orig.ident") + 
+  scale_x_continuous(limits = c(0, 10)) +
+  theme(legend.position = "none")
+
+# Arrange the plots
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd,
+                    "engTcellsOvarianCancer_RidgePlot_CD90.1_CD90.2_CD8a_CD4.pdf"), width = 10, height = 10)
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+dev.off()
+
+Idents(engTcellsOvarianCancer) <- "seurat_clusters"
+rna.markers<-FindAllMarkers(engTcellsOvarianCancer, assay='RNA', only.pos = TRUE, min.pct = 0.25)
+write.csv(rna.markers, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"RNA_FindAllMarkers.csv"))
+
+# Save seurat object
+saveRDS(engTcellsOvarianCancer, file = paste0(work_dir_rds, project_name, date_processed, fileAdd, "engTcellsOvarianCancermerged_sctPCAumapNN.Rds"))
+
+```
+### Notes from analysis so far
+
+```{r singleR}
+ref <- celldex::ImmGenData()
+
+DefaultAssay(engTcellsOvarianCancer) <- "RNA"
+
+test_assay <- GetAssayData(engTcellsOvarianCancer)
+predictions <- SingleR(test = test_assay, ref = ref, labels = ref$label.main)
+engTcellsOvarianCancer$singlr_labels=predictions$labels
+  
+DimPlot(engTcellsOvarianCancer, reduction = "umap", group.by='singlr_labels',label=TRUE, 
+        repel = TRUE, label.size = 4)
+
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, ".umap.with.singleRlabels.pdf"), height=10, width = 10)
+print(DimPlot(engTcellsOvarianCancer, reduction = "umap", group.by='singlr_labels',label=TRUE, 
+                repel = TRUE, label.size = 4)) + ggplot2::theme(legend.position = "none")
+dev.off()
+
+cellLabs=vector()
+for (lab in engTcellsOvarianCancer$singlr_labels){
+  if (lab %in% c('ILC')){
+    cellLabs=c(cellLabs,'ILC2')
+  }else if (lab %in% c('B cells','B cells, pro')){
+    cellLabs=c(cellLabs,'B cell')
+  }else if (lab %in% c('DC')){
+    cellLabs=c(cellLabs,'DC')
+  }else if (lab %in% c('Endothelial cells','Fibroblasts',
+                       'Stem cells','Stromal cells','Epithelial cells' )){
+    cellLabs=c(cellLabs,'Cancer')
+  }else if (lab %in% c('NK cells')){
+    cellLabs=c(cellLabs,'NK')
+  }else if (lab %in% c('NKT','T cells','Tgd')){
+    cellLabs=c(cellLabs,'T cell')
+  }else if (lab %in% c('Macrophages', 'Microglia')){
+    cellLabs=c(cellLabs,'Mac')    
+  }else if (lab %in% c('Monocytes')){
+    cellLabs=c(cellLabs,'Mono')
+  }else if (lab %in% c('Mast cells')){
+    cellLabs=c(cellLabs,"Mast")
+  }else if (lab %in% c('Eosinophils', 'Neutrophils', 'Basophils')){
+    cellLabs=c(cellLabs,'Granulocytes')
+  }}
+
+
+#Getting the antibody expression and plotting in Ridge and Vln plots
+antibodies <- engTcellsOvarianCancer@assays$ADT@counts@Dimnames[[1]]
+
+for (i in 1:length(antibodies)) {
+  p1 <- RidgePlot(engTcellsOvarianCancer, features = antibodies[i], group.by = "orig.ident") + 
+  scale_x_continuous(limits = c(0, 10)) +
+  theme(legend.position = "none")
+  p2 <- VlnPlot(engTcellsOvarianCancer, antibodies[i], raster = FALSE, group.by = "orig.ident") +
+  theme(legend.position = "none")
+  grid.arrange(p1, p2, ncol = 1)
+  
+  # Replace '/' and blank spaces with '_' in the antibody name for the file name. Some AB have that and will cause problems
+  file_name <- gsub("[/ ]", "_", antibodies[i])
+  
+  pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd,
+                    "engTcellsOvarianCancer_RidgePlot_VlnPlot", file_name,".pdf"), width = 10, height = 10)
+  grid.arrange(p1, p2, ncol = 1)
+  dev.off()
+}
+
+######  FIGURE 2 UMAP ######
+engTcellsOvarianCancer$newLabels=cellLabs
+#Make umap using the new labels
+colorVector=c('#fc4e2a','#980043','#9ebcda','#4d9221',
+              '#969696','#41b6c4','#2166ac','#00441b',
+              '#313695','#252525','#de77ae')
+DimPlot(engTcellsOvarianCancer, reduction = "umap", group.by='newLabels',label=FALSE,
+        cols=colorVector) & NoAxes()
+
+UMAPtableBYlibrary <- table(engTcellsOvarianCancer$newLabels, engTcellsOvarianCancer$orig.ident)
+write.csv(UMAPtableBYlibrary, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"UMAPtableBYlibrary.csv"))
+
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "engTcellsOvarianCancer.umap.with.singleRlabels.pdf"), height=10, width = 10)
+print(DimPlot(engTcellsOvarianCancer, reduction = "umap", group.by='newLabels',label=FALSE,
+        cols=colorVector)) + ggplot2::theme(plot.title = element_blank())
+dev.off()
+
+saveRDS(engTcellsOvarianCancer, file = paste0(work_dir_rds, project_name, date_processed, fileAdd, "engTcellsOvarianCancermerged_sctPCAumapNN.Rds"))
+
+```
+
+```{r T_cells}
+set.seed(123456)
+
+tcells <- subset(engTcellsOvarianCancer, newLabels =="T cell")
+# Transform the ADT data to a log scale
+tcells@assays$ADT@data <- log1p(tcells@assays$ADT@data)
+RidgePlot(tcells, group.by = "orig.ident", features=c('CD8a')) + coord_cartesian(xlim = c(0,5))
+RidgePlot(tcells, group.by = "orig.ident", features=c('CD90/CD90.1'))
+
+# Perform standard Seurat normalization steps
+
+tcells <- NormalizeData(tcells, normalization.method = "LogNormalize") %>%
+  FindVariableFeatures(nfeatures = 10000) %>% ScaleData() %>% RunPCA()
+
+ElbowPlot(tcells, ndims = 50)
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd,
+                    "tcells_SeuratObj_Merged_ElbowPlot.pdf"))
+ElbowPlot(tcells, ndims = 50)
+dev.off()
+
+tcells <- FindNeighbors(tcells, dims = 1:20)
+tcells <- FindClusters(tcells, resolution = 1)
+tcells <- RunUMAP(tcells, dims = 1:20)
+DimPlot(tcells, reduction = "umap",group.by='seurat_clusters',label=TRUE)
+
+plot_cells_by_metadata(tcells, "tcells", "orig.ident", work_dir_figures, project_name, 
+                       date_processed, fileAdd, reduction_type = "umap")
+
+Idents(tcells) <- "seurat_clusters"
+rna.markers<-FindAllMarkers(tcells, assay='RNA', min.pct = 0.25)
+write.csv(rna.markers, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"tcells_RNA_FindAllMarkers.csv"))
+
+# Save seurat object
+saveRDS(tcells, file = paste0(work_dir_rds, project_name, date_processed, fileAdd, "tcells.Rds"))
+
+Idents(tcells) <- "orig.ident"
+rna.markers<-FindAllMarkers(engTcellsOvarianCancer, assay='RNA', min.pct = 0.25)
+write.csv(rna.markers, file= paste0(work_dir_outputs, project_name,                                    date_processed,"RNA_FindAllMarkers_tCells_by_Orig.Ident.csv"))
+
+```
+
+``` {r engTcellsOnly}
+RidgePlot(tcells, features = "CD8a", group.by = "orig.ident") + ggplot2::theme(legend.position = "none")
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "tcells.RidgPlot.CD8a.pdf"), 
+    height=10, width = 10)
+print(RidgePlot(tcells, features = "CD8a", group.by = "orig.ident")) + ggplot2::theme(legend.position = "none")
+dev.off()
+
+RidgePlot(tcells, features = "CD90/CD90.1", group.by = "orig.ident") + ggplot2::theme(legend.position = "none")
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "tcells.RidgPlot.CD90.1.pdf"), 
+    height=10, width = 10)
+print(RidgePlot(tcells, features = "CD90/CD90.1", group.by = "orig.ident")) + ggplot2::theme(legend.position = "none")
+dev.off()
+
+adt_expression_cd8a <- tcells@assays$ADT@data["CD8a", ]
+adt_expression_cd90 <- tcells@assays$ADT@data["CD90/CD90.1", ]
+
+# Create a data frame
+df <- data.frame(CD8Expression = adt_expression_cd8a, CD90Expression = adt_expression_cd90)
+# Add a column for the library identity
+df$Library <- tcells$orig.ident
+
+# Calculate the percentage of cells within the quadrant for each library
+df$InQuadrant <- ifelse(df$CD8Expression >= 0.5 & df$CD90Expression >= 2, 1, 0)
+percentages <- aggregate(InQuadrant ~ Library, df, function(x) sum(x)/length(x)*100)
+df <- merge(df, percentages, by = "Library")
+
+# Print the percentages
+print(percentages)
+
+# Plot the data
+p1 <- ggplot(df, aes(x = CD8Expression, y = CD90Expression)) +
+  geom_point() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("ADT Expression of Cd8a") +
+  ylab("ADT Expression of CD90/CD90.1") +
+  ggtitle("Scatter plot of CD8a and CD90/CD90.1 Expression for All Libraries") +
+  geom_vline(xintercept = 0.5, linetype="dashed", color = "red") +  # Add vertical line at gene expression = 1
+  geom_hline(yintercept = 2, linetype="dashed", color = "red")  # Add horizontal line at ADT expression = 1.5
+
+# Combine the individual library plots and the all libraries plot
+p2 <- ggplot(df, aes(x = CD8Expression, y = CD90Expression)) +
+  geom_point() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("ADT Expression of Cd8a") +
+  ylab("ADT Expression of CD90/CD90.1") +
+  ggtitle("Scatter plot of CD8a and CD90/CD90.1 Expression") +
+  geom_vline(xintercept = 0.5, linetype="dashed", color = "red") +  # Add vertical line at gene expression = 1
+  geom_hline(yintercept = 2, linetype="dashed", color = "red") +  # Add horizontal line at ADT expression = 1.5
+  facet_wrap(~ Library) # Separate plot for each library
+
+# Display the plots
+gridExtra::grid.arrange(p1, p2, ncol = 1)
+
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "Cd8a_VS_Thy1.1_Gating.pdf"), height=10, width = 10)
+gridExtra::grid.arrange(p1, p2, ncol = 1)
+dev.off()
+
+#from this, get just the High Thy1.1 and CD8a T-cells
+Thy1CD8 <- (GetAssayData(tcells, assay = "ADT", layer = "data")["CD90/CD90.1", ] >= 2.0 & 
+            GetAssayData(tcells, assay = "ADT", layer = "data")["CD8a", ] >= 0.5)
+
+tcells <- AddMetaData(tcells,Thy1CD8, col.name = 'Thy1CD8')
+tcellsExo <- subset(tcells,subset=Thy1CD8==TRUE)
+table(tcellsExo$orig.ident)
+Idents(tcellsExo) <- tcellsExo$orig.ident
+PreTransferTcells <- tcellsExo[, tcellsExo$orig.ident %in% c("Pre-transfer eng. T cells")]
+
+tcellsExowithoutPreTransfer <- tcellsExo[, tcellsExo$orig.ident %in% c("eng. T cells + Isotype", 
+                                                    "eng. T cells + PD1",
+                                                    "eng. T cells + PD1 and Lag3", 
+                                                    "eng. T cells + PD1 and Tim3",
+                                                    "eng. T cells + Triple AB treatment")]
+table(tcellsExowithoutPreTransfer$orig.ident)
+
+# Perform standard Seurat normalization steps
+tcellsExowithoutPreTransfer <- NormalizeData(tcellsExowithoutPreTransfer, normalization.method = "LogNormalize") %>%
+  FindVariableFeatures(nfeatures = 10000) %>% ScaleData() %>% RunPCA()
+
+ElbowPlot(tcellsExowithoutPreTransfer)
+
+tcellsExowithoutPreTransfer <- FindNeighbors(tcellsExowithoutPreTransfer, dims = 1:20)
+tcellsExowithoutPreTransfer <- FindClusters(tcellsExowithoutPreTransfer, resolution = 1)
+tcellsExowithoutPreTransfer <- RunUMAP(tcellsExowithoutPreTransfer, dims = 1:20)
+DimPlot(tcellsExowithoutPreTransfer, reduction = "umap",group.by='seurat_clusters',label=TRUE)
+DimPlot(tcellsExowithoutPreTransfer, reduction = "umap",group.by='orig.ident',label=FALSE)
+
+plot_cells_by_metadata(tcellsExowithoutPreTransfer, "tcellsExowithoutPreTransfer","seurat_clusters", 
+                       work_dir_figures, project_name, date_processed, fileAdd)
+plot_cells_by_metadata(tcellsExowithoutPreTransfer, "tcellsExowithoutPreTransfer","orig.ident",
+                       work_dir_figures, project_name, date_processed, fileAdd)
+
+DefaultAssay(tcellsExowithoutPreTransfer) <- "RNA"
+rna.markers<-FindAllMarkers(tcellsExowithoutPreTransfer, assay='RNA', only.pos = TRUE, min.pct = 0.25)
+
+write.csv(rna.markers, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"tcellsExowithoutPreTransfer_RNAFindAllMarkers.csv"))
+
+rna.markers.pct10 <- FindAllMarkers(tcellsExowithoutPreTransfer, assay='RNA', min.pct = 0.10, test.use = "MAST")
+write.csv(rna.markers.pct10, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"tcellsExowithoutPreTransfer_rna.markers.pct10_MAST_test.csv"))
+
+rna.markers.pct15 <- FindAllMarkers(tcellsExowithoutPreTransfer, assay='RNA', min.pct = 0.15, test.use = "MAST")
+write.csv(rna.markers.pct15, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"tcellsExowithoutPreTransfer_rna.markers.pct15_MAST_test.csv"))
+
+rna.markers.pct20 <- FindAllMarkers(tcellsExowithoutPreTransfer, assay='RNA', min.pct = 0.20, test.use = "MAST")
+write.csv(rna.markers.pct20, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"tcellsExowithoutPreTransfer_rna.markers.pct20_MAST_test.csv"))
+
+rna.markers.pct25 <- FindAllMarkers(tcellsExowithoutPreTransfer, assay='RNA', min.pct = 0.25, test.use = "MAST")
+write.csv(rna.markers.pct25, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"tcellsExowithoutPreTransfer_rna.markers.pct25_MAST_test.csv"))
+
+saveRDS(tcellsExowithoutPreTransfer, file = paste0(work_dir_rds, project_name, date_processed, 
+                                                   fileAdd, "tcellsExowithoutPreTransfer.Rds"))
+
+
+```
+
+
+
+```{r heatmaps}
+Idents(tcellsExowithoutPreTransfer) <- "orig.ident"
+# Select top 20 genes from each 'orig.ident' group based on log fold change with the pct 10
+top.genes <- rna.markers.pct10 %>% group_by(cluster) %>% top_n(20, avg_log2FC)
+# Create the heatmap
+heatmap <- DoHeatmap(object = tcellsExowithoutPreTransfer, features = top.genes$gene)
+# Remove the labels but keep the legend
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "HeatMapTop20Genes.pct10.pdf"), height=10, width = 10)
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+dev.off()
+
+# Select top 20 genes from each 'orig.ident' group based on log fold change with the pct 15
+top.genes <- rna.markers.pct15 %>% group_by(cluster) %>% top_n(20, avg_log2FC)
+# Create the heatmap
+heatmap <- DoHeatmap(object = tcellsExowithoutPreTransfer, features = top.genes$gene)
+# Remove the labels but keep the legend
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "HeatMapTop20Genes.pct15.pdf"), height=10, width = 10)
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+dev.off()
+
+# Select top 20 genes from each 'orig.ident' group based on log fold change with the pct 20
+top.genes <- rna.markers.pct20 %>% group_by(cluster) %>% top_n(20, avg_log2FC)
+# Create the heatmap
+heatmap <- DoHeatmap(object = tcellsExowithoutPreTransfer, features = top.genes$gene)
+# Remove the labels but keep the legend
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "HeatMapTop20Genes.pct20.pdf"), height=10, width = 10)
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+dev.off()
+
+# Select top 20 genes from each 'orig.ident' group based on log fold change with the pct 25
+top.genes <- rna.markers.pct25 %>% group_by(cluster) %>% top_n(20, avg_log2FC)
+# Create the heatmap
+heatmap <- DoHeatmap(object = tcellsExowithoutPreTransfer, features = top.genes$gene)
+# Remove the labels but keep the legend
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "HeatMapTop20Genes.pct25.pdf"), height=10, width = 10)
+heatmap + theme(axis.text.x = element_blank(), axis.text.x.top = element_blank())
+dev.off()
+
+```
+
+```{r pretransfer}
+table(PreTransferTcells$orig.ident)
+DimPlot(PreTransferTcells, reduction = 'umap', label = TRUE, repel = TRUE, label.size = 4)
+
+PreTransferTcells <- NormalizeData(PreTransferTcells, normalization.method = "LogNormalize") %>%
+  FindVariableFeatures(nfeatures = 10000) %>% ScaleData() %>% RunPCA()
+
+ElbowPlot(PreTransferTcells, ndims = 50)
+
+PreTransferTcells <- FindNeighbors(PreTransferTcells, dims = 1:20)
+PreTransferTcells <- FindClusters(PreTransferTcells, resolution = 0.1)
+PreTransferTcells <- RunUMAP(PreTransferTcells, dims = 1:20)
+DimPlot(PreTransferTcells, reduction = "umap",group.by='seurat_clusters',label=TRUE)
+
+plot_cells_by_metadata(PreTransferTcells, "PreTransferTcells" ,"seurat_clusters", 
+                       work_dir_figures, project_name, date_processed, fileAdd, reduction_type = "umap")
+DimPlot(PreTransferTcells, reduction = "umap",group.by='seurat_clusters',label=TRUE)
+pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "PreTransferTcells_umap.pdf"), height=10, width = 10)
+DimPlot(PreTransferTcells, reduction = "umap",group.by='seurat_clusters',label=TRUE)
+dev.off()
+
+DefaultAssay(PreTransferTcells) <- "RNA"
+Idents(PreTransferTcells) <- "seurat_clusters"
+rna.markers<-FindAllMarkers(PreTransferTcells, assay='RNA', min.pct = 0.25)
+write.csv(rna.markers, file= paste0(work_dir_outputs, project_name,
+                                    date_processed,"PreTransferTcells_RNA_FindAllMarkers.csv"))
+
+saveRDS(PreTransferTcells, file = paste0(work_dir_rds, project_name, date_processed, fileAdd, "PreTransferTcells.Rds"))
+
+```
+
+
+```{r featureplots}
+# Define your features
+features <- c('Tcf7', 'Mki67', 'Ifng', 'Tox', 'Slamf6', 'Eomes', 'Tbx21',
+              'Ccl5', 'Ifitm1', 'Ifngr1', 'Gzmb', 'Cd37', 'Slamf7')
+
+# Loop over each feature
+for (feature in features) {
+  # Generate the FeaturePlot
+  p <- FeaturePlot(PreTransferTcells, reduction='umap', features=feature, max.cutoff='q95', pt.size=0.7, 
+                   cols = c("#d9d9d9", "#000000"), order = TRUE)
+  print(p)
+  # Save the plot to a PDF file
+  pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "PreTransferTcells_Feature_", feature, ".pdf"))
+  print(p)
+  dev.off()
+}
+
+for (feature in features) {
+  # Generate the FeaturePlot
+  p <- FeaturePlot(tcellsExowithoutPreTransfer, reduction='umap', features=feature, max.cutoff='q95', pt.size=0.7, 
+                   cols = c("#d9d9d9", "#000000"), order = TRUE)
+  print(p)
+  # Save the plot to a PDF file
+  pdf(file = paste0(work_dir_figures, project_name, date_processed, fileAdd, "tcellsExowithoutPreTransfer_Feature_", feature, ".pdf"))
+  print(p)
+  dev.off()
+}
+
+FeaturePlot(object = PreTransferTcells, 
+            min.cutoff = 0, features = ("Gzmb")) + scale_color_gradientn(colors = rev(rainbow(64,start=0,end=0.7))) + NoAxes()
+
+FeaturePlot(object = PreTransferTcells, 
+            min.cutoff = 0, features = ("Mki67")) + scale_color_gradientn(colors = rev(rainbow(64,start=0,end=0.7))) + NoAxes()
+
+FeaturePlot(object = PreTransferTcells, 
+            min.cutoff = 0, features = ("Tcf7")) + scale_color_gradientn(colors = rev(rainbow(64,start=0,end=0.7))) + NoAxes()
+
+FeaturePlot(object = PreTransferTcells, 
+            min.cutoff = 0, features = ("Ifitm1")) + scale_color_gradientn(colors = rev(rainbow(64,start=0,end=0.7))) + NoAxes()
+
+
+```
+
+
+```{r GSEA}
+mouse_human_genes = read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",
+                             sep="\t")
+
+gene_sets <- gmtPathways(paste0(base_dir, "/GSEA_Pathways/msigdb.v2023.1.Mm.symbols.gmt"))
+gene_sets2 <- gmtPathways(paste0(base_dir, "/GSEA_Pathways/msigdb.v2023.1.Hs.symbols.gmt"))
+
+ident1 <- "eng. T cells + Triple AB treatment"
+ident2 <- "eng. T cells + Isotype"
+
+fc <- get_fold_changes(tcellsExowithoutPreTransfer, ident1, ident2)
+gene_data <- fc$avg_log2FC
+names(gene_data) <- fc$rownames
+
+humanGenes <- convert_mouse_to_human(fc$rownames, mouse_human_genes)
+gene_data2 <- gene_data
+names(gene_data2) <- humanGenes
+
+plot_enrichment(gene_sets[["HALLMARK_MYC_TARGETS_V1"]], gene_data, "Hallmark MYC Targets V1", 
+                work_dir_figures, project_name, date_processed, fileAdd)
+plot_enrichment(gene_sets[["HALLMARK_OXIDATIVE_PHOSPHORYLATION"]], gene_data, 
+                "Hallmark Oxidative Phosphorylation", 
+                work_dir_figures, project_name, date_processed, fileAdd)
+plot_enrichment(gene_sets2[["GSE9650_EFFECTOR_VS_EXHAUSTED_CD8_TCELL_UP"]], gene_data2, 
+                "Effector Vs Exhausted CD8 T Cell", 
+                work_dir_figures, project_name, date_processed, fileAdd)
+plot_enrichment(gene_sets2[["GOBP_MITOCHONDRION_ORGANIZATION"]], gene_data2, 
+                "GOBP Mitochondrion Organization", 
+                work_dir_figures, project_name, date_processed, fileAdd)
+plot_enrichment(gene_sets2[["GSE41867_MEMORY_VS_EXHAUSTED_CD8_TCELL_DAY30_LCMV_UP"]], gene_data2, 
+                "Memory Vs Exhausted CD8 T Cell", 
+                work_dir_figures, project_name, date_processed, fileAdd)
+
+
+# Load necessary packages (if not already loaded)
+library(GSEA_R)
+
+# Read mouse-human gene mapping data
+mouse_human_genes <- read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt", sep="\t")
+
+# Load mouse gene sets (Hallmark and Reactome)
+gene_sets <- gmtPathways(paste0(base_dir, "/GSEA_Pathways/msigdb.v2023.1.Mm.symbols.gmt"))
+gene_sets2 <- gmtPathways(paste0(base_dir, "/GSEA_Pathways/msigdb.v2023.1.Hs.symbols.gmt"))
+
+# Define your identifiers
+ident1 <- "eng. T cells + Triple AB treatment"
+ident2 <- "eng. T cells + Isotype"
+
+# Get fold changes and gene data
+fc <- get_fold_changes(tcellsExowithoutPreTransfer, ident1, ident2)
+gene_data <- fc$avg_log2FC
+names(gene_data) <- fc$rownames
+
+# Convert gene names to human
+humanGenes <- convert_mouse_to_human(fc$rownames, mouse_human_genes)
+gene_data2 <- gene_data
+names(gene_data2) <- humanGenes
+
+# Calculate enrichment scores and p-values
+fgseaRes <- fgsea(pathways = gene_sets, stats = gene_data, minSize = 15, maxSize = 500)
+fgseaRes2 <- fgsea(pathways = gene_sets2, stats = gene_data2, minSize = 15, maxSize = 500)
+
+# Print the results (you can save them to a file if needed)
+print(fgseaRes)
+print(fgseaRes2)
+
+```
+
+``` {r pathways_preTransfer}
+#Get the pair wise differential expression
+Idents(PreTransferTcells) <- "seurat_clusters"
+genes_de_0_1 <- FindMarkers(PreTransferTcells, ident.1 = "0", ident = "1", test.use = "MAST")
+genes_de_0_2 <- FindMarkers(PreTransferTcells, ident.1 = "0", ident = "2", test.use = "MAST")
+genes_de_0_3 <- FindMarkers(PreTransferTcells, ident.1 = "0", ident = "3", test.use = "MAST")
+
+
+
+```
+
+
+# Session Info
+
+```{r sessionInfo, echo=FALSE}
+sessionInfo()
+```
+
